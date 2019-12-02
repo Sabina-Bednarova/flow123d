@@ -74,8 +74,11 @@ class Assembly<dim> {
 	map.setup_mapping_fields(this->all_fields);
 	ep.set_mapping(map);
 	....
-	this->mass_eval = this->ep.add_bulk(Gauss(dim, order));
-	this->face_eval = this->ep.add_side(Gauss(dim-1, order));
+	this->mass_eval = this->ep.add_bulk<dim>(Gauss(dim, order));
+	this->face_eval = this->ep.add_side<dim>(Gauss(dim-1, order));
+		
+	this->ngh_bulk_eval = this->ep.add_bulk<dim>(Gauss(dim, order));
+	this->ngh_side_eval = this->ep.add_side<dim+1>(Gauss(dim, order));
         ...
 ```
 
@@ -100,6 +103,18 @@ must not be templated (by dimension). The only field algorithm that needs absolu
 `FieldValueCache` has a vector with start and size of active blocks of the quadrature points.
 
 TODO: Different assembly loops may need different evaluation subsets, so either we need mean to reallocate caches before every assembly loop or just update only selected part of the field value cache. Current structure of FieldValueCache allows to have allocated individual EvalSubset tables separately and update only selected subsets. Moreover the other subsets do not block the CPU cache (example of associativity, seems that AMD processors have 4way L1, 16way L2 and 64way L3 cache; try to get similar info for Intel) anyway we shuld mak an analysis how many memory blocks we need in any computation loop. Innermost loops should idealy access at most 4 memory blocks (4 pointers). 
+
+Theoretical memory blocks:
+- eq_data (all field instances), in theory all auxiliary objects (EvalPoints, ...), but that would need inplace Armor Array; or some clever allocation sequence
+- Field regions - vectors 
+  Field caches - Arrays
+- field algorithm instances (consider FieldConstant as a single instance with table of values for all regions)
+
+Blocks necessary in the single patch assembly loop:
+- eq_data, field instances, EvalPoints, 
+- field caches 
+- fe_values caches
+
 
 ### FieldValueCache
 In principle this is just a table of items of type Value with dimensions: n_cached_elements x n_evaluation_points. Other properties to keep:
@@ -170,7 +185,9 @@ Two major algorithms are in use:
     // Asumme following types:
     EvalSubset this->mass_eval;
     EvalSubset this->side_eval;
-    EvalSubset this->ngh_side_eval;
+    
+    // ??? how to get side_eval for higher dim
+    EvalSubset this->ngh_side_eval = NghIntegral(this->mass_eval, this->side_eval_higher_dim;
     */
     
     ...
@@ -202,13 +219,18 @@ Two major algorithms are in use:
     }
     
     // Dimension coupling
-    // TODO: update
+    /**
+    TODO:
+    - how to have ngh subsets updated only around fractures
+    - how to access cache (and other data) of higher dimension
+    */
     for (DHNeighbSide ngh_side cache_cell.neighb_sides()) {        
-        // vector of local side quadrature points in the correct side permutation
-        Range<BulkPoint> side_points = this->ngh_side_eval.points(ngh_side);
-        for (auto p : side_points) {
-            side_avg += cross_section(el_ngh_p) * sigma(el_ngh_p) * 
-                ( velocity(side_p) + velocity(el_ngh_p)) * side_p.normal();
+        // vector of local side quadrature points in the correct side permutation        
+        for (NghSidePoint side_p : this->ngh_side_eval.points(ngh_side)) {
+ 	    BulkPoint bulk_p = side_p.bulk_point();	
+            side_avg += cross_section(bulk_p) * sigma(bulk_p) * 
+                ( velocity(side_p) + velocity(bulk_p)) * side_p.normal();
+	    flux += cross_section(bulk_p) * sigma(bulk_p) * (pressure(side_p) - pressssure(bulk_p)); 
         }
     }
 }
@@ -239,11 +261,14 @@ but we also need its proper permutation, to this end we provide SidePoint and it
 `FieldFE<..>::base_grad(SidePoint, component)`
 
 **Interface for dimension coupling integrals**
-In general the quadrature can be different then the quadrature used on faces, or the could be no integration over the faces as in the case of P1 method. No problem for the lower dim element as we have to evaluate fields at all bulk points on al these elements. Only matching evaluation points on the connected side of a bulk element are necessary. Moreover we are not able to change mask of evaluation point accoring to the elements. 
+In general the quadrature can be different then the quadrature used on faces (e.g. for continuous P1 elements there are no face integrals at all). In theory the bulk integral on the lower dim element can use a different quadrature then rest of bulk integrals, however usually this will use the same quadrature. The problem is how to omit side values for the higher dim neighbour elements.
 
 Two possible solutions:
 - local point sets varies with elements
-- evaluation of noncached values, but still want to have the FieldValues in FieldFE for their points
+- FieldValueCache shared between dimensions, variable number of elements in the patch, dynamically adding the subsets
+- evaluation of noncached values:
+  - huge performance penalty for FieldFormula
+  - but still want to have the FieldValues in FieldFE for their points
 
 
 
@@ -262,5 +287,5 @@ TODO:
 
 - We introduce fields for absolute cooridinates X, Y, Z  as well as for the depth, this is related to the generalization of the FieldFormula, that can use also other fields in the formulas.
 
-
+- How to treat FieldConstant efficiently, ?? caching is inefficient in this case.
 
