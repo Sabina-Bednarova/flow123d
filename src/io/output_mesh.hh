@@ -24,9 +24,11 @@
 #include "input/accessors.hh"         // for Record
 #include "mesh/point.hh"
 #include "tools/general_iterator.hh"  // for Iter
+#include "system/index_types.hh"      // for LongIdx
 #include "system/armor.hh"            // for Armor::array
 
 class Mesh;
+class Distribution;
 class OutputElement;
 class OutputMesh;
 class OutputMeshDiscontinuous;
