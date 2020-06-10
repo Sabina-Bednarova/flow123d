@@ -74,6 +74,7 @@
 #include <vector>                      // for vector
 #include <array>
 #include <armadillo>
+#include "system/armor.hh"
 #include "system/asserts.hh"
 
 
@@ -169,8 +170,8 @@ public:
      * e.g. coordinates (a,b,c) on triangle with vertices X, Y, Z
      * represents a point: a*X+b*Y+c*Z
      */
-    typedef arma::vec::fixed<dim+1> BaryPoint;
-    typedef arma::vec::fixed<dim> FaceBaryPoint;
+    typedef Armor::ArmaVec<double, dim+1> BaryPoint;
+    typedef Armor::ArmaVec<double, dim> FaceBaryPoint;
         
 	/**
 	 * Return coordinates of given node.
@@ -262,7 +263,7 @@ public:
 	 * 2     2
 	 * 3     6
 	 */
-	static const unsigned int n_side_permutations = (dim+1)*(2*dim*dim-5*dim+6)/6;
+	static constexpr unsigned int n_side_permutations = (dim+1)*(2*dim*dim-5*dim+6)/6;
 
 	/**
 	 * Permutations of nodes on sides.
@@ -412,10 +413,53 @@ private:
 };
 
 
+// Declarations of explicit specialization of static memebers.
+
 template<> const IdxVector<1> RefElement<0>::topology_zeros_[];
 template<> const IdxVector<2> RefElement<1>::topology_zeros_[];
 template<> const IdxVector<3> RefElement<2>::topology_zeros_[];
 template<> const IdxVector<6> RefElement<3>::topology_zeros_[];
+
+
+template<> const std::vector<IdxVector<2>> RefElement<1>::line_nodes_;
+template<> const std::vector<IdxVector<2>> RefElement<2>::line_nodes_;
+template<> const std::vector<IdxVector<2>> RefElement<3>::line_nodes_;
+template<> const std::vector<IdxVector<1>> RefElement<1>::node_lines_;
+template<> const std::vector<IdxVector<2>> RefElement<2>::node_lines_;
+
+template<> const std::vector<IdxVector<3>> RefElement<3>::node_lines_;
+template<> const std::vector<IdxVector<3>> RefElement<3>::side_nodes_;
+template<> const std::vector<IdxVector<3>> RefElement<3>::node_sides_;
+template<> const std::vector<IdxVector<2>> RefElement<3>::line_sides_;
+template<> const std::vector<IdxVector<3>> RefElement<3>::side_lines_;
+
+
+template<> const std::vector< std::vector<unsigned int> > RefElement<0>::side_permutations;
+template<> const std::vector< std::vector<unsigned int> > RefElement<1>::side_permutations;
+template<> const std::vector< std::vector<unsigned int> > RefElement<2>::side_permutations;
+template<> const std::vector< std::vector<unsigned int> > RefElement<3>::side_permutations;
+
+template<> const IdxVector<1> RefElement<0>::topology_zeros_[];
+template<> const IdxVector<2> RefElement<1>::topology_zeros_[];
+template<> const IdxVector<3> RefElement<2>::topology_zeros_[];
+template<> const IdxVector<6> RefElement<3>::topology_zeros_[];
+
+
+
+
+
+
+// 0: nodes of nodes
+// 1: nodes of lines
+// 2: nodes of sides
+// 3: nodes of tetrahedron
+template<> const std::vector< std::vector< std::vector<unsigned int> > > RefElement<0>::nodes_of_subelements;
+template<> const std::vector< std::vector< std::vector<unsigned int> > > RefElement<1>::nodes_of_subelements;
+template<> const std::vector< std::vector< std::vector<unsigned int> > > RefElement<2>::nodes_of_subelements;
+template<> const std::vector< std::vector< std::vector<unsigned int> > > RefElement<3>::nodes_of_subelements;
+
+
+
 
 
 
@@ -586,7 +630,7 @@ inline const IdxVector< (InDim>OutDim ? InDim+1 : dim-InDim) > RefElement<dim>::
     ASSERT(false)(dim)(OutDim)(InDim)(i).error("Not implemented.");
     //ASSERT_LT_DBG(OutDim, dim);
     //ASSERT_LT_DBG(InDim, dim);
-    return IdxVector<(InDim>OutDim ? InDim+1 : dim-InDim)>();
+    return IdxVector< (InDim>OutDim ? InDim+1 : dim-InDim) >();  // just to avoid warning for missing return
 }
 
 
