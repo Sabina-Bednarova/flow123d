@@ -23,6 +23,8 @@
 //#include <iterator>
 //#include <algorithm>
 #include <armadillo>
+#include <cstdlib>
+#include <stdio.h>
 
 #include "petscmat.h"
 #include "petscviewer.h"
@@ -128,11 +130,24 @@ const it::Record & DarcyMH::type_field_descriptor() {
         return field_descriptor;
 }
 
+const it::Selection & DarcyMH::EqData::nonlinear_solver_type() {
+	return it::Selection("Flow_Darcy_nonlinear_solver_type")
+        .add_value(Picard, "Picard",
+            "Solving nonlinear term by using Picard's iterations.")
+        .add_value(Newton, "Newton",
+            "Solving nonlinear term by using Newton's method.")
+        .add_value(Lscheme, "Lscheme",
+            "Solving nonlinear term by using L-scheme method.")
+        .close();
+} 
+
 const it::Record & DarcyMH::get_input_type() {
 
     it::Record ns_rec = Input::Type::Record("NonlinearSolver", "Non-linear solver settings.")
         .declare_key("linear_solver", LinSys::get_input_type(), it::Default("{}"),
             "Linear solver for MH problem.")
+        .declare_key("solver_type", DarcyMH::EqData::nonlinear_solver_type(), it::Default("\"Picard\""),
+            "Nonlinear solver.") 
         .declare_key("tolerance", it::Double(0.0), it::Default("1E-6"),
             "Residual tolerance.")
         .declare_key("min_it", it::Integer(0), it::Default("1"),
@@ -198,7 +213,7 @@ DarcyMH::EqData::EqData()
              .flags(FieldFlag::equation_result)
              .description("Piezo head solution - P0 interpolation.");
 
-	*this += field_ele_velocity.name("velocity_p0")
+    *this += field_ele_velocity.name("velocity_p0")
 	         .units(UnitSI().m().s(-1))
              .flags(FieldFlag::equation_result)
              .description("Velocity solution - P0 interpolation.");
@@ -223,6 +238,7 @@ DarcyMH::EqData::EqData()
             .description("Transition coefficient between dimensions.")
             .input_default("1.0")
             .units( UnitSI::dimensionless() );
+
 
     *this += water_source_density.name("water_source_density")
             .description("Water source density.")
@@ -276,6 +292,17 @@ DarcyMH::EqData::EqData()
             .input_default("0.0")
             .units( UnitSI().m(-1) );
 
+    //Darcy-Forchheimer
+    *this += beta.name("beta")
+            .description("Forchheimer coefficient")
+            .input_default("0.0")
+            .units( UnitSI::dimensionless() );
+    
+    *this += L.name("l_param")
+            .description("L-scheme coefficient")
+            .input_default("0.0")
+            .units( UnitSI::dimensionless() );
+
     //time_term_fields = this->subset({"storativity"});
     //main_matrix_fields = this->subset({"anisotropy", "conductivity", "cross_section", "sigma", "bc_type", "bc_robin_sigma"});
     //rhs_fields = this->subset({"water_source_density", "bc_pressure", "bc_flux"});
@@ -300,6 +327,7 @@ DarcyMH::DarcyMH(Mesh &mesh_in, const Input::Record in_rec)
     output_object(nullptr),
     data_changed_(false),
     schur0(nullptr),
+    schur0_Newton(nullptr),
 	steady_diagonal(nullptr),
 	steady_rhs(nullptr),
 	new_diagonal(nullptr),
@@ -317,8 +345,11 @@ DarcyMH::DarcyMH(Mesh &mesh_in, const Input::Record in_rec)
 
     data_ = make_shared<EqData>();
     EquationBase::eq_data_ = data_.get();
+
+    data_->ns_type = input_record_.val<Input::Record>("nonlinear_solver").val<EqData::nonlinear_solver>("solver_type");
     
     data_->is_linear=true;
+
 
     size = mesh_->n_elements() + mesh_->n_sides() + mesh_->n_edges();
     n_schur_compls = in_rec.val<int>("n_schurs");
@@ -406,7 +437,11 @@ void DarcyMH::initialize() {
     }
 
     init_eq_data();
+    //int ns_type = input_record_.val<Input::Record>("nonlinear_solver").val<EqData::nonlinear_solver>("solver_type");
     this->data_->multidim_assembler =  AssemblyBase::create< AssemblyMH >(data_);
+    if (data_->ns_type == EqData::nonlinear_solver::Newton) {
+        this->data_->multidim_assembler_Newton =  AssemblyBase::create< AssemblyMH_Newton >(data_);
+    }
     output_object = new DarcyFlowMHOutput(this, input_record_);
 
     { // construct pressure, velocity and piezo head fields
@@ -450,9 +485,10 @@ void DarcyMH::initialize() {
 
     // auxiliary set_time call  since allocation assembly evaluates fields as well
     data_changed_ = data_->set_time(time_->step(), LimitSide::right) || data_changed_;
-    create_linear_system(rec);
-
-
+    create_linear_system(rec, schur0, true);
+    if (data_->ns_type == EqData::nonlinear_solver::Newton){
+        create_linear_system(rec, schur0_Newton, false);
+    }
 
     // allocate time term vectors
     VecDuplicate(schur0->get_solution(), &previous_solution);
@@ -461,7 +497,6 @@ void DarcyMH::initialize() {
     VecZeroEntries(new_diagonal);
     VecDuplicate(steady_diagonal, &steady_rhs);
 
-
     // initialization of balance object
     balance_ = std::make_shared<Balance>("water", mesh_);
     balance_->init_from_input(input_record_.val<Input::Record>("balance"), time());
@@ -469,9 +504,9 @@ void DarcyMH::initialize() {
     balance_->allocate(data_->dh_->distr()->lsize(), 1);
     balance_->units(UnitSI().m(3));
 
-
     data_->balance = balance_;
     data_->lin_sys = schur0;
+    data_->lin_sys_Newton = schur0_Newton;
 
 
     initialize_specific();
@@ -575,13 +610,24 @@ bool DarcyMH::zero_time_term(bool time_global) {
     }
 }
 
+void DarcyMH::compute_full_residual_vec(Vec residual_) //vector residual must be alocated
+{
+    MatMult(*schur0->get_matrix(), schur0->get_solution(), residual_);
+    VecAXPBY(residual_,1.0,-1.0,*schur0->get_rhs());
+    //VecAXPY(residual_,1.0, *schur0->get_rhs());
+}
 
 void DarcyMH::solve_nonlinear()
 {
-
     assembly_linear_system();
-    double residual_norm = schur0->compute_residual();
+    Vec residual_;
+    VecDuplicate(schur0->get_solution(), &residual_);
+    double residual_norm;
+    compute_full_residual_vec(residual_);
+    VecNorm(residual_, NORM_2, &residual_norm);
     nonlinear_iteration_ = 0;
+    //int ns_type = input_record_.val<Input::Record>("nonlinear_solver").val<EqData::nonlinear_solver>("solver_type");
+
     MessageOut().fmt("[nonlinear solver] norm of initial residual: {}\n", residual_norm);
 
     // Reduce is_linear flag.
@@ -600,6 +646,8 @@ void DarcyMH::solve_nonlinear()
     }
     vector<double> convergence_history;
 
+    compute_full_residual_vec(residual_);
+    VecNorm(residual_, NORM_2, &residual_norm);
     Vec save_solution;
     VecDuplicate(schur0->get_solution(), &save_solution);
     while (nonlinear_iteration_ < this->min_n_it_ ||
@@ -619,16 +667,44 @@ void DarcyMH::solve_nonlinear()
                 THROW(ExcSolverDiverge() << EI_Reason("Stagnation."));
             }
         }
-
-        if (! is_linear_common)
+        auto si = LinSys::SolveInfo(0,0);
+        if (! is_linear_common){
+            if (data_->ns_type == EqData::nonlinear_solver::Newton){
+                data_changed_=true;
+                Vec solution_update;
+                VecDuplicate(schur0->get_solution(), &solution_update);
+                if ( nonlinear_iteration_ > 0){
+                    assembly_linear_system();
+                    data_changed_ = true;
+                    VecDuplicate(schur0->get_solution(), &residual_);
+                    compute_full_residual_vec(residual_);
+                }
+                assembly_linear_system_Newton(residual_);
+                VecCopy( schur0_Newton->get_solution(), save_solution);
+                //double residual_rhs;
+                //VecNorm(*schur0_Newton->get_rhs(), NORM_2, &residual_rhs);
+                //printf("%f \n", residual_rhs);
+                si = schur0_Newton->solve();
+                //double residual_newt;
+                //VecNorm(schur0_Newton->get_solution(), NORM_2, &residual_newt);
+                //printf("%f \n", residual_newt);
+                VecWAXPY(solution_update,1.0,schur0_Newton->get_solution(),schur0->get_solution());
+                VecCopy(solution_update,schur0->get_solution());
+               
+                //data_changed_=true;
+            }else{
             VecCopy( schur0->get_solution(), save_solution);
-        LinSys::SolveInfo si = schur0->solve();
-        nonlinear_iteration_++;
+            si = schur0->solve();
+            }
+            nonlinear_iteration_++;
+        }
 
         // hack to make BDDC work with empty compute_residual
         if (is_linear_common){
             // we want to print this info in linear (and steady) case
-            residual_norm = schur0->compute_residual();
+            si = schur0->solve();
+            compute_full_residual_vec(residual_);
+            VecNorm(residual_, NORM_2, &residual_norm);
             MessageOut().fmt("[nonlinear solver] lin. it: {}, reason: {}, residual: {}\n",
         		si.n_iterations, si.converged_reason, residual_norm);
             break;
@@ -642,9 +718,12 @@ void DarcyMH::solve_nonlinear()
         //OLD_ASSERT( si.converged_reason >= 0, "Linear solver failed to converge. Convergence reason %d \n", si.converged_reason );
         assembly_linear_system();
 
-        residual_norm = schur0->compute_residual();
+        VecDuplicate(schur0->get_solution(), &residual_);
+        compute_full_residual_vec(residual_);
+        VecNorm(residual_, NORM_2, &residual_norm);
         MessageOut().fmt("[nonlinear solver] it: {} lin. it: {}, reason: {}, residual: {}\n",
         		nonlinear_iteration_, si.n_iterations, si.converged_reason, residual_norm);
+        chkerr(VecDestroy(&residual_));
     }
     chkerr(VecDestroy(&save_solution));
     this -> postprocess();
@@ -751,13 +830,12 @@ void DarcyMH::assembly_mh_matrix(MultidimAssembly& assembler)
 }
 
 
-void DarcyMH::allocate_mh_matrix()
+void DarcyMH::allocate_mh_matrix(LinSys *ls)
 {
     START_TIMER("DarcyFlowMH_Steady::allocate_mh_matrix");
 
     // set auxiliary flag for switchting Dirichlet like BC
     data_->n_schur_compls = n_schur_compls;
-    LinSys *ls = schur0;
 
     // to make space for second schur complement, max. 10 neighbour edges of one el.
     double zeros[100000];
@@ -841,6 +919,7 @@ void DarcyMH::allocate_mh_matrix()
         ls->mat_set_values(tmp_rows.size(), tmp_rows.data(), tmp_rows.size(), tmp_rows.data(), zeros);  // neigh edges  x neigh edges
 
     }
+}
 /*
     // alloc edge diagonal entries
     if(rank == 0)
@@ -862,7 +941,6 @@ void DarcyMH::allocate_mh_matrix()
     } else if (mortar_method_ == MortarP1) {
         P1_CouplingAssembler(*this).assembly(*ls);
     }*/
-}
 
 void DarcyMH::assembly_source_term()
 {
@@ -871,7 +949,7 @@ void DarcyMH::assembly_source_term()
 
     std::vector<LongIdx> global_dofs(data_->dh_->max_elem_dofs());
 
-   	for ( DHCellAccessor dh_cell : data_->dh_->own_range() ) {
+  	for ( DHCellAccessor dh_cell : data_->dh_->own_range() ) {
         ElementAccessor<3> ele = dh_cell.elm();
 
         const uint ndofs = dh_cell.n_dofs();
@@ -888,6 +966,7 @@ void DarcyMH::assembly_source_term()
 
         balance_->add_source_values(data_->water_balance_idx, ele.region().bulk_idx(),
                                     {dh_cell.get_loc_dof_indices()[ndofs/2]}, {0}, {source});
+
     }
 
     balance_->finish_source_assembly(data_->water_balance_idx);
@@ -900,11 +979,11 @@ void DarcyMH::assembly_source_term()
  * COMPOSE WATER MH MATRIX WITHOUT SCHUR COMPLEMENT
  ******************************************************************************/
 
-void DarcyMH::create_linear_system(Input::AbstractRecord in_rec) {
+void DarcyMH::create_linear_system(Input::AbstractRecord in_rec, LinSys *&linsys, bool set_solution) {
   
     START_TIMER("preallocation");
 
-    if (schur0 == NULL) { // create Linear System for MH matrix
+    if (linsys == NULL) { // create Linear System for MH matrix
        
     	if (in_rec.type() == LinSys_BDDC::get_input_type()) {
 #ifdef FLOW123D_HAVE_BDDCML
@@ -913,11 +992,13 @@ void DarcyMH::create_linear_system(Input::AbstractRecord in_rec) {
             LinSys_BDDC *ls = new LinSys_BDDC(&(*data_->dh_->distr()),
                     true); // swap signs of matrix and rhs to make the matrix SPD
             ls->set_from_input(in_rec);
-            ls->set_solution( ele_flux_ptr->get_data_vec().petsc_vec() );
+            if (set_solution == true){
+                    ls->set_solution( ele_flux_ptr->get_data_vec().petsc_vec() );
+                }
             // possible initialization particular to BDDC
             START_TIMER("BDDC set mesh data");
             set_mesh_data_for_bddc(ls);
-            schur0=ls;
+            linsys = ls;
             END_TIMER("BDDC set mesh data");
 #else
             Exception
@@ -942,9 +1023,10 @@ void DarcyMH::create_linear_system(Input::AbstractRecord in_rec) {
                 else {
                     ls->LinSys::set_from_input(in_rec); // get only common options
                 }
-
-                ls->set_solution( ele_flux_ptr->get_data_vec().petsc_vec() );
-                schur0=ls;
+                if (set_solution == true){
+                    ls->set_solution( ele_flux_ptr->get_data_vec().petsc_vec() );
+                }
+                linsys=ls;
             } else {
                 IS is;
                 auto side_dofs_vec = get_component_indices_vec(0);
@@ -988,17 +1070,20 @@ void DarcyMH::create_linear_system(Input::AbstractRecord in_rec) {
                 }
                 ls->set_complement( schur1 );
                 ls->set_from_input(in_rec);
-                ls->set_solution( ele_flux_ptr->get_data_vec().petsc_vec() );
-                schur0=ls;
+                if (set_solution == true){
+                    ls->set_solution( ele_flux_ptr->get_data_vec().petsc_vec() );
+                }else{
+                    ls->set_solution();
+                }
+                linsys=ls;
             }
 
             START_TIMER("PETSC PREALLOCATION");
-            schur0->set_symmetric();
-            schur0->start_allocation();
-            
-            allocate_mh_matrix();
-            
-    	    VecZeroEntries(schur0->get_solution());
+            linsys->set_symmetric();
+            linsys->start_allocation();
+
+            allocate_mh_matrix(linsys);
+            VecZeroEntries(linsys->get_solution());
             END_TIMER("PETSC PREALLOCATION");
         }
         else {
@@ -1010,13 +1095,10 @@ void DarcyMH::create_linear_system(Input::AbstractRecord in_rec) {
 
 }
 
-
-
-
 void DarcyMH::assembly_linear_system() {
     START_TIMER("DarcyFlowMH_Steady::assembly_linear_system");
 
-    data_->is_linear=true;
+    data_-> is_linear = data_->beta.field_result(mesh_->region_db().get_region_set("BULK")) == result_zeros;
     bool is_steady = zero_time_term();
 	//DebugOut() << "Assembly linear system\n";
 	if (data_changed_) {
@@ -1059,6 +1141,63 @@ void DarcyMH::assembly_linear_system() {
 		START_TIMER("modify system");
 		if (! is_steady) {
 			modify_system();
+		} else {
+			//xprintf(PrgErr, "Planned computation time for steady solver, but data are not changed.\n");
+		}
+		END_TIMER("modiffy system");
+	}
+
+}
+
+void DarcyMH::assembly_linear_system_Newton(Vec &residual_) {
+    START_TIMER("DarcyFlowMH_Steady::assembly_linear_system");
+
+    data_-> is_linear = data_->beta.field_result(mesh_->region_db().get_region_set("BULK")) == result_zeros;
+    bool is_steady = zero_time_term();
+	//DebugOut() << "Assembly linear system\n";
+	if (data_changed_) {
+	    data_changed_ = false;
+	    //DebugOut()  << "Data changed\n";
+		// currently we have no optimization for cases when just time term data or RHS data are changed
+	    START_TIMER("full assembly");
+        if (typeid(*schur0_Newton) != typeid(LinSys_BDDC)) {
+            schur0_Newton->start_add_assembly(); // finish allocation and create matrix
+        }
+
+        schur0_Newton->mat_zero_entries();
+        schur0_Newton->rhs_zero_entries();
+
+        //PetscViewer    viewer;
+        //VecView( *const_cast<Vec*>(schur0_Newton->get_rhs()), viewer);
+
+	    assembly_mh_matrix( data_->multidim_assembler_Newton ); // fill matrix
+
+        schur0_Newton->set_rhs(residual_);
+        //VecView( *const_cast<Vec*>(schur0_Newton->get_rhs()), viewer);
+
+	    schur0_Newton->finish_assembly();
+//         print_matlab_matrix("matrix");
+	    schur0_Newton->set_matrix_changed();
+            //MatView( *const_cast<Mat*>(schur0->get_matrix()), PETSC_VIEWER_STDOUT_WORLD  );
+            //VecView( *const_cast<Vec*>(schur0->get_rhs()),   PETSC_VIEWER_STDOUT_WORLD);
+
+	    /*if (! is_steady) {
+	        START_TIMER("fix time term");
+	    	//DebugOut() << "setup time term\n";
+	    	// assembly time term and rhs
+	    	setup_time_term();
+	    	modify_system();
+	    }
+	    else
+	    {
+	    	balance_->start_mass_assembly(data_->water_balance_idx);
+	    	balance_->finish_mass_assembly(data_->water_balance_idx);
+	    }*/
+	    END_TIMER("full assembly");
+	} else {
+		START_TIMER("modify system");
+		if (! is_steady) {
+			modify_system_Newton();
 		} else {
 			//xprintf(PrgErr, "Planned computation time for steady solver, but data are not changed.\n");
 		}
@@ -1331,6 +1470,10 @@ DarcyMH::~DarcyMH() {
         delete schur0;
     }
 
+    if (schur0_Newton != NULL) {
+        delete schur0_Newton;
+    }
+
 	if (output_object)	delete output_object;
 
     if(time_ != nullptr)
@@ -1452,6 +1595,29 @@ void DarcyMH::modify_system() {
 	VecPointwiseMult(*( schur0->get_rhs()), new_diagonal, schur0->get_solution());
     VecAXPY(*( schur0->get_rhs()), 1.0, steady_rhs);
     schur0->set_rhs_changed();
+
+    //VecSwap(previous_solution, schur0->get_solution());
+}
+
+void DarcyMH::modify_system_Newton() {
+	START_TIMER("modify system");
+	if (time_->is_changed_dt() && time_->step().index()>0) {
+        double scale_factor=time_->step(-2).length()/time_->step().length();
+        if (scale_factor != 1.0) {
+            // if time step has changed and setup_time_term not called
+            MatDiagonalSet(*( schur0_Newton->get_matrix() ),steady_diagonal, INSERT_VALUES);
+
+            VecScale(new_diagonal, time_->last_dt()/time_->dt());
+            MatDiagonalSet(*( schur0_Newton->get_matrix() ),new_diagonal, ADD_VALUES);
+            schur0_Newton->set_matrix_changed();
+        }
+	}
+
+    // modify RHS - add previous solution
+    //VecPointwiseMult(*( schur0->get_rhs()), new_diagonal, previous_solution);
+	VecPointwiseMult(*( schur0_Newton->get_rhs()), new_diagonal, schur0_Newton->get_solution());
+    VecAXPY(*( schur0_Newton->get_rhs()), 1.0, steady_rhs);
+    schur0_Newton->set_rhs_changed();
 
     //VecSwap(previous_solution, schur0->get_solution());
 }

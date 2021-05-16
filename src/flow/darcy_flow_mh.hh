@@ -160,9 +160,16 @@ public:
             seepage=5,
             river=6
         };
+        
+        enum nonlinear_solver {
+            Picard = 0,
+            Newton = 1,
+            Lscheme = 2
+        }; 
 
         /// Return a Selection corresponding to enum BC_Type.
         static const Input::Type::Selection & get_bc_type_selection();
+        static const Input::Type::Selection & nonlinear_solver_type();
 
         /// Creation of all fields.
         EqData();
@@ -173,6 +180,8 @@ public:
         Field<3, FieldValue<3>::Scalar > cross_section;
         Field<3, FieldValue<3>::Scalar > water_source_density;
         Field<3, FieldValue<3>::Scalar > sigma;
+	    Field<3, FieldValue<3>::Scalar > beta;
+        Field<3, FieldValue<3>::Scalar > L;
         
         BCField<3, FieldValue<3>::Enum > bc_type; // Discrete need Selection for initialization
         BCField<3, FieldValue<3>::Scalar > bc_pressure; 
@@ -207,6 +216,7 @@ public:
 
         std::shared_ptr<Balance> balance;
         LinSys *lin_sys;
+        LinSys *lin_sys_Newton;
         
         unsigned int n_schur_compls;
         int is_linear;              ///< Hack fo BDDC solver.
@@ -218,6 +228,9 @@ public:
     	VectorMPI full_solution;     //< full solution [vel,press,lambda] from 2. Schur complement
         
         MultidimAssembly multidim_assembler;
+        MultidimAssembly multidim_assembler_Newton;
+
+        int ns_type;                //non-linear solver type
     };
 
     /// Selection for enum MortarMethod.
@@ -264,6 +277,7 @@ protected:
     /// Solve method common to zero_time_step and update solution.
     void solve_nonlinear();
     void modify_system();
+    void modify_system_Newton();
     virtual void setup_time_term();
 
 
@@ -273,7 +287,7 @@ protected:
     /**
      * Create and preallocate MH linear system (including matrix, rhs and solution vectors)
      */
-    void create_linear_system(Input::AbstractRecord rec);
+    void create_linear_system(Input::AbstractRecord rec, LinSys *&linsys, bool set_solution);
 
     /**
      * Read initial condition into solution vector.
@@ -299,7 +313,7 @@ protected:
      * TODO:
      * - use general preallocation methods in DofHandler
      */
-    void allocate_mh_matrix();
+    void allocate_mh_matrix(LinSys *ls);
 
     /**
      * Assembles linear system matrix for MH.
@@ -319,6 +333,9 @@ protected:
      * Assembly or update whole linear system.
      */
     virtual void assembly_linear_system();
+
+    virtual void assembly_linear_system_Newton(Vec &residual_);
+
 
     void set_mesh_data_for_bddc(LinSys_BDDC * bddc_ls);
     /**
@@ -354,6 +371,7 @@ protected:
 
 
 	LinSys *schur0;  		//< whole MH Linear System
+    LinSys *schur0_Newton;  //< whole MH for Newton
 
 	Vec steady_diagonal;
     Vec steady_rhs;
@@ -376,6 +394,7 @@ protected:
 private:
   /// Registrar of class to factory
   static const int registrar;
+  void compute_full_residual_vec(Vec residual);
 };
 
 
